@@ -3,5 +3,6 @@ resolver = "2"
 members = ["app", "lib"]
 
 [workspace.dependencies]
-actix-web = "4.4"
+tokio = { version = "1.38", features = ["full"] }
+bytes = "1"
 serde = { version = "1.0", features = ["derive"] }
