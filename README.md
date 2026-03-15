@@ -1,75 +1,61 @@
 # dependabot-cargo-workspace-sample
 
-Reproduction repository for a Dependabot Cargo workspace issue where `pin_version` does not apply to `[workspace.dependencies]`, causing a version mismatch error.
+Minimal reproduction for `cargo update -p` conservative update behavior that caused Dependabot `unknown_error: null`.
 
 ## The Problem
 
-When Dependabot updates a Cargo dependency in a workspace, its `LockfileUpdater` calls `pin_version` to set an exact version constraint (e.g., `=4.11.0`). However, `pin_version` only processes `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]` — it does not process `[workspace.dependencies]`.
-
-In a workspace member with `actix-web.workspace = true`, `pin_version` adds `version = "=4.11.0"` to the member's `[dependencies]` entry. But Cargo ignores the `version` key when `workspace = true` is present:
-
-```
-warning: unused manifest key: dependencies.actix-web.version
-```
-
-The actual version constraint comes from `[workspace.dependencies]`, which the `ManifestUpdater` changed to `"4.11.0"` (interpreted as `^4.11.0`). Cargo resolves to the latest version matching `^4.11.0` (e.g., 4.13.0), but Dependabot expects exactly 4.11.0. The mismatch triggers `RuntimeError: Failed to update actix-web!`, which surfaces as `unknown_error: null` in GitHub Actions.
-
-## Reproduction Steps
-
-### Prerequisites
-
-- Rust toolchain installed
-- This repository cloned with its `Cargo.lock` (contains actix-web 4.9.0, actix-server 2.5.0)
-
-### Step 1: Verify initial state
+`cargo update -p actix-web` stops at version 4.10.2 instead of reaching 4.13.0, because the conservative update strategy does not update transitive dependencies (actix-server, once_cell) that are already satisfied by the intermediate version.
 
 ```console
-$ grep -A1 '^name = "actix-web"$' Cargo.lock
-name = "actix-web"
-version = "4.9.0"
-
-$ grep -A1 '^name = "actix-server"$' Cargo.lock
-name = "actix-server"
-version = "2.5.0"
+$ cargo update -p actix-web --verbose
+   Unchanged actix-server v2.5.0 (available: v2.6.0)
+    Updating actix-web v4.9.0 -> v4.10.2 (available: v4.13.0)
+   Unchanged once_cell v1.20.1 (available: v1.21.4)
 ```
 
-### Step 2: Simulate Dependabot's ManifestUpdater
+actix-web 4.10.2 requires `actix-server ^2` and `once_cell ^1.5`, both satisfied by the locked versions. actix-web 4.11.0+ requires `actix-server ^2.6` and `once_cell ^1.21`, which the locked versions cannot satisfy.
 
-Change `[workspace.dependencies]` in `Cargo.toml`:
-
-```diff
--actix-web = "4.4"
-+actix-web = "4.11.0"
-```
-
-### Step 3: Run cargo update (as Dependabot's LockfileUpdater does)
+## Reproduction
 
 ```console
-$ cargo update -p actix-web:4.9.0
-    Updating actix-server v2.5.0 -> v2.6.0
-    Updating actix-web v4.9.0 -> v4.13.0
+$ git clone https://github.com/uuushiro/dependabot-cargo-workspace-sample
+$ cd dependabot-cargo-workspace-sample
+$ cargo update -p actix-web
+    Updating actix-web v4.9.0 -> v4.10.2 (available: v4.13.0)
 ```
 
-### Step 4: Observe the mismatch
+### Why sentry is needed
 
-Cargo selected **4.13.0** (latest matching `^4.11.0`), but Dependabot's `desired_lockfile_content` expects **4.11.0**.
+Without `sentry` + `sentry-actix`, Cargo's resolver updates actix-server and once_cell to reach actix-web 4.13.0. The additional complexity from sentry's dependency graph causes the resolver to prefer falling back to actix-web 4.10.2 rather than updating the locked transitive dependencies.
 
-```ruby
-# In lockfile_updater.rb (before PR #12487 fix):
-desired = 'name = "actix-web"\nversion = "4.11.0"'
-lockfile.include?(desired)  # => false (lockfile has 4.13.0)
-raise "Failed to update actix-web!"  # => unknown_error: null in GitHub Actions
-```
+## Cargo's documentation
 
-## Root Cause
+From [`cargo update`](https://doc.rust-lang.org/cargo/commands/cargo-update.html):
 
-`pin_version` in [`lockfile_updater.rb`](https://github.com/dependabot/dependabot-core/blob/main/cargo/lib/dependabot/cargo/file_updater/lockfile_updater.rb) iterates over `DEPENDENCY_TYPES = %w(dependencies dev-dependencies build-dependencies)` but does not process `workspace.dependencies`. The exact version constraint `=4.11.0` is never applied to the workspace dependency declaration.
+> Its transitive dependencies will be updated only if SPEC cannot be updated without updating dependencies.
+
+Cargo's test suite documents this behavior in [`transitive_minor_update`](https://github.com/rust-lang/cargo/blob/master/tests/testsuite/update.rs#L65) with the comment:
+
+> Also note that this is probably **counterintuitive and weird**. We may wish to change this one day.
 
 ## Fix
 
-[PR #12487](https://github.com/dependabot/dependabot-core/pull/12487) added a fallback that accepts any version newer than the previous version, working around this issue. The root cause (`pin_version` not handling `[workspace.dependencies]`) remains unfixed.
+The solution is to update the transitive dependencies together:
+
+```console
+$ cargo update -p actix-web -p actix-server -p once_cell
+    Updating actix-server v2.5.0 -> v2.6.0
+    Updating actix-web v4.9.0 -> v4.13.0
+    Updating once_cell v1.20.1 -> v1.21.4
+```
+
+Or update everything:
+
+```console
+$ cargo update
+```
 
 ## Related
 
-- [dependabot/dependabot-core#12487](https://github.com/dependabot/dependabot-core/pull/12487) — The workaround fix
-- [uuushiro/dependabot-cargo-sample](https://github.com/uuushiro/dependabot-cargo-sample) — Reproduction for a related but different issue (direct dependency causing intermediate version stop)
+- [dependabot-core PR #12487](https://github.com/dependabot/dependabot-core/pull/12487) — Dependabot fix to accept partial updates
+- [Cargo `transitive_minor_update` test](https://github.com/rust-lang/cargo/blob/master/tests/testsuite/update.rs#L65) — Cargo's own test for this behavior
